@@ -7,7 +7,11 @@ SECURITY NOTES:
 - Only return cookie value in BrowserCookieResult.cookie field, never in message
 """
 
+import json
+import os
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass
@@ -35,13 +39,87 @@ class BrowserCookieResult:
 
 SUPPORTED_BROWSERS = ["chrome", "firefox", "safari", "edge", "chromium", "brave", "opera"]
 
+# User data dirs for Chromium-family browsers, relative to the platform base dir.
+# browser_cookie3 only reads the "Default" profile; these let us find the others.
+_CHROMIUM_DIRS = {
+    "darwin": {
+        "chrome": "Google/Chrome",
+        "chromium": "Chromium",
+        "brave": "BraveSoftware/Brave-Browser",
+        "edge": "Microsoft Edge",
+    },
+    "linux": {
+        "chrome": "google-chrome",
+        "chromium": "chromium",
+        "brave": "BraveSoftware/Brave-Browser",
+        "edge": "microsoft-edge",
+    },
+    "win32": {
+        "chrome": "Google/Chrome/User Data",
+        "chromium": "Chromium/User Data",
+        "brave": "BraveSoftware/Brave-Browser/User Data",
+        "edge": "Microsoft/Edge/User Data",
+    },
+}
 
-def extract_tp_cookie(browser: str | None = None) -> BrowserCookieResult:
+
+def _chromium_user_data_dir(browser: str) -> Path | None:
+    """Return the user data dir for a Chromium-family browser, if known."""
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    elif sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    platform_key = sys.platform if sys.platform in ("darwin", "win32") else "linux"
+    rel = _CHROMIUM_DIRS[platform_key].get(browser)
+    return base / rel if rel else None
+
+
+def _profile_cookie_file(profile_dir: Path) -> Path | None:
+    """Return the cookie DB inside a Chromium profile dir, if present."""
+    for candidate in (profile_dir / "Network" / "Cookies", profile_dir / "Cookies"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _chromium_profiles(browser: str) -> list[tuple[str, str]]:
+    """List (directory name, display name) for each profile, Default first."""
+    user_data = _chromium_user_data_dir(browser)
+    if not user_data or not user_data.is_dir():
+        return []
+
+    display_names: dict[str, str] = {}
+    try:
+        local_state = json.loads((user_data / "Local State").read_text(encoding="utf-8"))
+        for dir_name, info in local_state.get("profile", {}).get("info_cache", {}).items():
+            display_names[dir_name] = info.get("name") or dir_name
+    except (OSError, ValueError):
+        pass
+
+    dirs = {d.name for d in user_data.iterdir() if d.is_dir() and _profile_cookie_file(d)}
+    ordered = sorted(dirs, key=lambda d: (d != "Default", d))
+    return [(d, display_names.get(d, d)) for d in ordered]
+
+
+def _resolve_profile(browser: str, profile: str) -> str | None:
+    """Match a profile by directory name ("Profile 1") or display name ("Person 1")."""
+    wanted = profile.strip().lower()
+    for dir_name, display_name in _chromium_profiles(browser):
+        if wanted in (dir_name.lower(), display_name.lower()):
+            return dir_name
+    return None
+
+
+def extract_tp_cookie(browser: str | None = None, profile: str | None = None) -> BrowserCookieResult:
     """Extract TrainingPeaks cookie from browser.
 
     Args:
         browser: Browser name (chrome, firefox, safari, edge, chromium, brave, opera).
                  If None, tries all browsers in order.
+        profile: Chromium-family profile, by directory ("Profile 1") or display
+                 name ("Person 1"). If None, every profile is searched.
 
     Returns:
         BrowserCookieResult with cookie if found.
@@ -71,17 +149,51 @@ def extract_tp_cookie(browser: str | None = None) -> BrowserCookieResult:
         if not func:
             return BrowserCookieResult(success=False, message=f"Unknown browser: {name}")
 
-        try:
-            cj = func(domain_name=".trainingpeaks.com")
+        def find_cookie(cookie_file: str | None = None) -> str | None:
+            cj = func(cookie_file=cookie_file, domain_name=".trainingpeaks.com")
             for cookie in cj:
                 if cookie.name == "Production_tpAuth" and cookie.value:
+                    return cookie.value
+            return None
+
+        try:
+            profiles = _chromium_profiles(name) if name in _CHROMIUM_DIRS["darwin"] else []
+
+            if profile:
+                if not profiles:
                     return BrowserCookieResult(
-                        success=True,
-                        cookie=cookie.value,
-                        browser=name,
-                        message=f"Found cookie in {name}",
+                        success=False, message=f"Profile selection is not supported for {name}"
                     )
-            return BrowserCookieResult(success=False, message=f"No TrainingPeaks cookie in {name}")
+                dir_name = _resolve_profile(name, profile)
+                if not dir_name:
+                    available = ", ".join(f"{d} ({n})" for d, n in profiles)
+                    return BrowserCookieResult(
+                        success=False,
+                        message=f"No {name} profile named '{profile}'. Available: {available}",
+                    )
+                profiles = [p for p in profiles if p[0] == dir_name]
+
+            if not profiles:
+                value = find_cookie()
+                if value:
+                    return BrowserCookieResult(
+                        success=True, cookie=value, browser=name, message=f"Found cookie in {name}"
+                    )
+                return BrowserCookieResult(success=False, message=f"No TrainingPeaks cookie in {name}")
+
+            user_data = _chromium_user_data_dir(name)
+            for dir_name, display_name in profiles:
+                cookie_file = _profile_cookie_file(user_data / dir_name)
+                value = find_cookie(str(cookie_file))
+                if value:
+                    label = f"{name} ({display_name})"
+                    return BrowserCookieResult(
+                        success=True, cookie=value, browser=label, message=f"Found cookie in {label}"
+                    )
+            searched = ", ".join(n for _, n in profiles)
+            return BrowserCookieResult(
+                success=False, message=f"No TrainingPeaks cookie in {name} (profiles: {searched})"
+            )
         except PermissionError:
             return BrowserCookieResult(
                 success=False,
@@ -102,6 +214,11 @@ def extract_tp_cookie(browser: str | None = None) -> BrowserCookieResult:
                 message=f"Unknown browser: {browser}. Supported: {', '.join(SUPPORTED_BROWSERS)}",
             )
         return try_browser(browser)
+
+    if profile:
+        return BrowserCookieResult(
+            success=False, message="A profile can only be used with a specific browser"
+        )
 
     # Try all browsers in order
     errors = []

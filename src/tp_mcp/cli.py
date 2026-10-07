@@ -15,12 +15,13 @@ from tp_mcp.auth import (
 from tp_mcp.auth.browser import extract_tp_cookie
 
 
-def cmd_auth(from_browser: str | None = None) -> int:
+def cmd_auth(from_browser: str | None = None, profile: str | None = None) -> int:
     """Interactive authentication flow.
 
     Args:
         from_browser: Browser to extract cookie from (chrome, firefox, etc.)
                       If None, prompts for manual cookie input.
+        profile: Browser profile to read (e.g. "Profile 1" or "Person 1").
 
     Returns:
         Exit code (0 for success, 1 for failure).
@@ -52,7 +53,9 @@ def cmd_auth(from_browser: str | None = None) -> int:
     # Get cookie from browser or manual input
     if from_browser:
         print(f"Extracting cookie from {from_browser}...")
-        browser_result = extract_tp_cookie(from_browser if from_browser != "auto" else None)
+        browser_result = extract_tp_cookie(
+            from_browser if from_browser != "auto" else None, profile=profile
+        )
         if not browser_result.success:
             print(f"Error: {browser_result.message}")
             return 1
@@ -207,6 +210,8 @@ def cmd_help() -> int:
     print("Commands:")
     print("  auth                  Authenticate with TrainingPeaks")
     print("    --from-browser X    Extract cookie from browser (chrome, firefox, safari, edge, auto)")
+    print("    --profile NAME      Chrome/Edge/Brave profile, e.g. \"Profile 1\" or \"Person 1\"")
+    print("                        (default: search all profiles)")
     print("  auth-status           Check authentication status")
     print("  auth-clear            Clear stored cookie")
     print("  config                Output Claude Desktop config snippet")
@@ -217,6 +222,7 @@ def cmd_help() -> int:
     print("  tp-mcp auth                      # Manual cookie entry")
     print("  tp-mcp auth --from-browser auto  # Auto-detect browser")
     print("  tp-mcp auth --from-browser chrome")
+    print("  tp-mcp auth --from-browser chrome --profile \"Person 1\"")
     print()
     return 0
 
@@ -243,7 +249,18 @@ def main() -> int:
             else:
                 print("Error: --from-browser requires a browser name (chrome, firefox, auto, etc.)")
                 return 1
-        return cmd_auth(from_browser=from_browser)
+        profile = None
+        if "--profile" in args:
+            idx = args.index("--profile")
+            if idx + 1 < len(args):
+                profile = args[idx + 1]
+            else:
+                print("Error: --profile requires a profile name (e.g. \"Profile 1\")")
+                return 1
+            if not from_browser or from_browser == "auto":
+                print("Error: --profile requires --from-browser with a specific browser")
+                return 1
+        return cmd_auth(from_browser=from_browser, profile=profile)
 
     commands = {
         "auth-status": cmd_auth_status,
